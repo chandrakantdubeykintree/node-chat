@@ -13,9 +13,23 @@ const SOCKET_EVENTS = {
   // ... other events
 
   MESSAGE_DELIVERED_ACK: "messageDeliveredAck",
-  MESSAGE_STATUS_UPDATE: "messageStatusUpdate",
+  MARK_MESSAGE_READ: "markMessageRead",
   MARK_CHANNEL_READ: "markChannelRead",
+  MARK_CHANNEL_DELIVERED: "markChannelDelivered",
+  MESSAGE_STATUS_UPDATE: "messageStatusUpdate",
   CHANNEL_READ_UPDATE: "channelReadUpdate",
+  CHANNEL_BULK_DELIVERED_UPDATE: "channelBulkDeliveredUpdate",
+  CHANNEL_BULK_READ_UPDATE: "channelBulkReadUpdate",
+};
+
+const safeStringify = (key, value) => {
+  if (value instanceof Set) {
+    // Convert Sets to Arrays for JSON serialization
+    return Array.from(value);
+  }
+  // Add more handlers if needed (e.g., for Maps, specific object types)
+  // Handle circular references if they become an issue (more complex)
+  return value;
 };
 
 // Store connected users { userId: socketId } - simplistic, refine for multiple connections per user if needed
@@ -30,18 +44,14 @@ const registerSocketHandlers = (io, socket) => {
 
   // Store user connection
   connectedUsers.set(userId, socket.id);
-  console.log(`User ${userId} associated with socket ${socket.id}`);
   // TODO: Emit presence update if needed
 
   if (!connectedUsers.has(userId)) {
     // Could store multiple socket IDs if needed
     connectedUsers.set(userId, socket.id);
-    console.log(`User ${userId} mapped to socket ${socket.id}`);
   } else {
     // Handle cases where user might connect from multiple devices/tabs if needed
-    console.log(
-      `User ${userId} already has a mapped socket. Current socket: ${socket.id}`
-    );
+
     // Update the map or store multiple IDs per user
     connectedUsers.set(userId, socket.id); // Simple override for now
   }
@@ -49,28 +59,73 @@ const registerSocketHandlers = (io, socket) => {
   // --- Channel Handling ---
 
   socket.on("getChannels", async (callback) => {
-    console.log(`User ${userId} requested channels`);
+    const socketId = socket.id; // Capture socket ID for logging
     try {
       const response = await makePhpRequest("get", "/user/channels", userToken);
-      if (response.success) {
-        // Join rooms for each channel
-        response.data.forEach((channel) => {
-          socket.join(`channel_${channel.id}`);
-          console.log(`User ${userId} joined room channel_${channel.id}`);
+
+      if (response?.success) {
+        const channelsData = response.data || []; // Ensure it's an array
+
+        // --- Log EXACT Data Sent to Client (CRITICAL) ---
+        const callbackData = { success: true, channels: channelsData };
+        try {
+          // Use safeStringify here!
+          const jsonData = JSON.stringify(callbackData, safeStringify);
+        } catch (stringifyError) {
+          console.error(
+            `[Socket ${socketId}] !!! Failed to stringify getChannels callback data: ${stringifyError.message}`
+          );
+          console.error(
+            `[Socket ${socketId}] Problematic callbackData object:`,
+            callbackData
+          );
+          // Don't send potentially broken data back
+          callback({
+            success: false,
+            error: "Internal server error processing channel data.",
+          });
+          return; // Stop execution for this handler
+        }
+        // --- End Log EXACT Data ---
+
+        // Join rooms (keep this logic)
+        channelsData.forEach((channel) => {
+          // Check if channel and channel.id exist before joining
+          if (
+            channel &&
+            typeof channel.id !== "undefined" &&
+            channel.id !== null
+          ) {
+            socket.join(`channel_${channel.id}`);
+          } else {
+            console.warn(
+              `[Socket ${socketId}] Skipping join for invalid channel object in getChannels response:`,
+              channel
+            );
+          }
         });
-        callback({ success: true, channels: response.data });
+
+        // Execute Callback
+        callback(callbackData);
       } else {
-        callback({
+        console.error(
+          `[Socket ${socketId}] PHP failed fetching channels: ${response?.message}`
+        );
+        const errorCallbackData = {
           success: false,
-          error: response.message || "Failed to fetch channels",
-        });
+          error: response?.message || "Failed to fetch channels",
+        };
+
+        callback(errorCallbackData);
       }
     } catch (error) {
       console.error(
-        `Error fetching channels for user ${userId}:`,
+        `[Socket ${socketId}] Error fetching/processing channels:`,
         error.message
       );
-      callback({ success: false, error: error.message });
+      const exceptionCallbackData = { success: false, error: error.message };
+
+      callback(exceptionCallbackData);
     }
   });
 
@@ -79,17 +134,6 @@ const registerSocketHandlers = (io, socket) => {
   socket.on(
     "getMessages",
     async ({ channelId, page = 1, limit = 20 }, callback) => {
-      // --- ADD DETAILED LOGGING ---
-      console.log(`\n--- Handling getMessages ---`);
-      console.log(
-        ` User ${userId} requested messages for channel ${channelId}, page ${page}`
-      );
-      console.log(
-        ` getMessages: Using token: ${
-          userToken ? userToken.substring(0, 10) + "..." : "MISSING!"
-        }`
-      ); // Verify token
-
       if (!userToken) {
         console.error(`getMessages Error: Token missing for user ${userId}`);
         return callback({
@@ -103,36 +147,20 @@ const registerSocketHandlers = (io, socket) => {
       }
 
       const phpPath = `/user/channels/${channelId}/messages?page=${page}&limit=${limit}`;
-      console.log(` getMessages: Calling PHP Path: ${phpPath}`); // Verify path and page param
 
       try {
         // Make the request using the authenticated user's token
         const response = await makePhpRequest("get", phpPath, userToken);
 
-        // --- LOG THE RAW PHP RESPONSE ---
-        console.log(
-          ` getMessages: RAW PHP Response Success: ${response?.success}`
-        );
-        // Use JSON.stringify to see the full nested structure, including nulls
-        console.log(
-          ` getMessages: RAW PHP Response Data:`,
-          JSON.stringify(response?.data, null, 2)
-        );
         // Specifically log timestamps for a sample message if available
         if (response?.data?.messages && response.data.messages.length > 0) {
           const sampleMsg = response.data.messages[0];
-          console.log(
-            ` getMessages: Sample Msg ID ${sampleMsg.id} - delivered_at: ${sampleMsg.delivered_at}, read_at: ${sampleMsg.read_at}, sent_by_me: ${sampleMsg.message_sent_by_me}`
-          );
         }
         // --- END RAW RESPONSE LOG ---
 
         if (response.success && response.data) {
           // Relay the exact data received from PHP
           callback({ success: true, messagesData: response.data });
-          console.log(
-            ` getMessages: Successfully relayed messagesData to client.`
-          );
         } else {
           console.error(
             `getMessages Error: PHP returned failure or no data - ${
@@ -162,14 +190,12 @@ const registerSocketHandlers = (io, socket) => {
             "Failed to fetch messages",
         });
       }
-      console.log(`--- Finished getMessages ---\n`);
     }
   );
 
   socket.on(
     "sendMessage",
     async ({ channelId, message, attachment_id }, callback) => {
-      console.log(`User ${userId} sending message to channel ${channelId}`);
       try {
         // Use FormData because PHP expects it
         const formData = new FormData();
@@ -197,7 +223,6 @@ const registerSocketHandlers = (io, socket) => {
             channelId,
             message: newMessage,
           });
-          console.log(`Message broadcasted to channel_${channelId}`);
           callback({ success: true, message: newMessage }); // Confirm to sender
         } else {
           callback({
@@ -221,9 +246,6 @@ const registerSocketHandlers = (io, socket) => {
   socket.on(
     "editMessage",
     async ({ channelId, messageId, message }, callback) => {
-      console.log(
-        `User ${userId} editing message ${messageId} in channel ${channelId}`
-      );
       try {
         const formData = new FormData();
         formData.append("message", message);
@@ -267,9 +289,6 @@ const registerSocketHandlers = (io, socket) => {
   );
 
   socket.on("deleteMessage", async ({ channelId, messageId }, callback) => {
-    console.log(
-      `User ${userId} deleting message ${messageId} from channel ${channelId}`
-    );
     try {
       const response = await makePhpRequest(
         "delete",
@@ -294,80 +313,75 @@ const registerSocketHandlers = (io, socket) => {
     }
   });
 
-  socket.on("markMessageRead", async ({ channelId, messageId }, callback) => {
-    console.log(
-      `User ${userId} marking message ${messageId} as read in channel ${channelId}`
-    );
-    try {
-      // PHP expects PUT, but makePhpRequest can handle it or use axios directly
-      const response = await makePhpRequest(
-        "put",
-        `/user/channels/${channelId}/messages/${messageId}/mark-as-read`,
-        userToken
-      );
-      if (response.success) {
-        // Notify relevant users (subtle: who needs this update? Potentially only the sender)
-        // For simplicity broadcast for now, can be optimized
-        io.to(`channel_${channelId}`).emit("messageStatusUpdate", {
-          channelId,
-          messageId,
-          status: "read",
-          read_at: new Date().toISOString() /* or get from PHP response */,
-        });
-        callback({ success: true });
-      } else {
-        callback({
-          success: false,
-          error: response.message || "Failed to mark as read",
-        });
-      }
-    } catch (error) {
-      console.error(
-        `Error marking message ${messageId} as read:`,
-        error.message
-      );
-      callback({ success: false, error: error.message });
-    }
-  });
+  // socket.on("markMessageRead", async ({ channelId, messageId }, callback) => {
+  //   try {
+  //     // PHP expects PUT, but makePhpRequest can handle it or use axios directly
+  //     const response = await makePhpRequest(
+  //       "put",
+  //       `/user/channels/${channelId}/messages/${messageId}/mark-as-read`,
+  //       userToken
+  //     );
+  //     if (response.success) {
+  //       // Notify relevant users (subtle: who needs this update? Potentially only the sender)
+  //       // For simplicity broadcast for now, can be optimized
+  //       io.to(`channel_${channelId}`).emit("messageStatusUpdate", {
+  //         channelId,
+  //         messageId,
+  //         status: "read",
+  //         read_at: new Date().toISOString() /* or get from PHP response */,
+  //       });
+  //       callback({ success: true });
+  //     } else {
+  //       callback({
+  //         success: false,
+  //         error: response.message || "Failed to mark as read",
+  //       });
+  //     }
+  //   } catch (error) {
+  //     console.error(
+  //       `Error marking message ${messageId} as read:`,
+  //       error.message
+  //     );
+  //     callback({ success: false, error: error.message });
+  //   }
+  // });
 
-  socket.on("markChannelRead", async ({ channelId }, callback) => {
-    console.log(`User ${userId} marking channel ${channelId} as read`);
-    if (!channelId)
-      return callback({ success: false, error: "Channel ID required" });
+  // socket.on("markChannelRead", async ({ channelId }, callback) => {
+  //   if (!channelId)
+  //     return callback({ success: false, error: "Channel ID required" });
 
-    try {
-      // Call the PHP endpoint: PUT /user/channels/:channelId/mark-as-read
-      const response = await makePhpRequest(
-        "put",
-        `/user/channels/${channelId}/mark-as-read`,
-        userToken
-      );
+  //   try {
+  //     // Call the PHP endpoint: PUT /user/channels/:channelId/mark-as-read
+  //     const response = await makePhpRequest(
+  //       "put",
+  //       `/user/channels/${channelId}/mark-as-read`,
+  //       userToken
+  //     );
 
-      if (response.success) {
-        // Notify the user's other sessions/devices (and potentially others in group?)
-        // Emit to the specific user's room if implemented, or just broadcast to channel for simplicity
-        io.to(`channel_${channelId}`).emit("channelMessagesRead", {
-          channelId,
-        });
-        callback({ success: true });
-      } else {
-        callback({
-          success: false,
-          error: response.message || "PHP request failed",
-        });
-      }
-    } catch (error) {
-      console.error(
-        `Error marking channel ${channelId} read for user ${userId}:`,
-        error.message
-      );
-      callback({ success: false, error: error.message });
-    }
-  });
+  //     if (response.success) {
+  //       // Notify the user's other sessions/devices (and potentially others in group?)
+  //       // Emit to the specific user's room if implemented, or just broadcast to channel for simplicity
+  //       io.to(`channel_${channelId}`).emit("channelMessagesRead", {
+  //         channelId,
+  //       });
+  //       callback({ success: true });
+  //     } else {
+  //       callback({
+  //         success: false,
+  //         error: response.message || "PHP request failed",
+  //       });
+  //     }
+  //   } catch (error) {
+  //     console.error(
+  //       `Error marking channel ${channelId} read for user ${userId}:`,
+  //       error.message
+  //     );
+  //     callback({ success: false, error: error.message });
+  //   }
+  // });
 
   // --- Clear Chat Handler ---
   socket.on("clearChannelChat", async ({ channelId }, callback) => {
-    console.log(`User ${userId} clearing chat for channel ${channelId}`);
     if (!channelId)
       return callback({ success: false, error: "Channel ID required" });
 
@@ -406,7 +420,6 @@ const registerSocketHandlers = (io, socket) => {
 
   // --- Delete Channel Handler ---
   socket.on("deleteChannel", async ({ channelId }, callback) => {
-    console.log(`User ${userId} deleting channel ${channelId}`);
     if (!channelId)
       return callback({ success: false, error: "Channel ID required" });
 
@@ -448,10 +461,6 @@ const registerSocketHandlers = (io, socket) => {
       const userId = socket.userData.id;
       const userToken = socket.token;
 
-      console.log(
-        `User ${userId} requested to create channel. is_group: ${is_group}, userIds: ${userIds}`
-      );
-
       if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
         return callback({
           success: false,
@@ -487,9 +496,6 @@ const registerSocketHandlers = (io, socket) => {
         // if (thumbnail_image_file) { formData.append('thumbnail_image', ...); }
 
         const phpUrl = "/user/channels";
-        console.log(
-          ` createChannel: POSTing FormData to PHP URL: ${config.phpBackendUrl}${phpUrl}`
-        );
 
         // Use the raw axios client for FormData
         const response = await phpApiClient.post(phpUrl, formData, {
@@ -500,21 +506,12 @@ const registerSocketHandlers = (io, socket) => {
           },
         });
 
-        console.log(` createChannel: PHP Response Status: ${response.status}`);
-        console.log(` createChannel: PHP Response Data:`, response.data);
-
         // PHP might return success even if channel exists, giving back the existing channel data
         if (response.data && response.data.success) {
           const channelData = response.data.data; // Assuming PHP returns the channel data
-          console.log(
-            `Channel created/fetched successfully on PHP: ID ${channelData.id}`
-          );
 
           // Make the creating user join the Socket.IO room for the new channel
           socket.join(`channel_${channelData.id}`);
-          console.log(
-            `User ${userId} joined new room channel_${channelData.id}`
-          );
 
           // Notify the *other* participants (if they are online) that a new channel was created
           userIds.forEach((otherUserId) => {
@@ -527,9 +524,6 @@ const registerSocketHandlers = (io, socket) => {
               const otherSocket = io.sockets.sockets.get(otherSocketId);
               if (otherSocket) {
                 otherSocket.join(`channel_${channelData.id}`);
-                console.log(
-                  `User ${otherUserId} automatically joined room channel_${channelData.id}`
-                );
               }
             }
           });
@@ -572,8 +566,6 @@ const registerSocketHandlers = (io, socket) => {
 
   socket.on(SOCKET_EVENTS.START_TYPING, ({ channelId }) => {
     if (!channelId) return;
-    // console.log(`User ${userId} started typing in channel ${channelId}`); // Optional verbose log
-    // Broadcast to everyone else in the room *except* the sender
     socket.to(`channel_${channelId}`).emit(SOCKET_EVENTS.USER_TYPING, {
       channelId,
       userId,
@@ -583,190 +575,267 @@ const registerSocketHandlers = (io, socket) => {
 
   socket.on(SOCKET_EVENTS.STOP_TYPING, ({ channelId }) => {
     if (!channelId) return;
-    // console.log(`User ${userId} stopped typing in channel ${channelId}`); // Optional verbose log
-    // Broadcast to everyone else in the room *except* the sender
     socket.to(`channel_${channelId}`).emit(SOCKET_EVENTS.USER_STOPPED_TYPING, {
       channelId,
       userId,
     });
   });
 
-  // --- Handle Delivery Acknowledgement from Client ---
   socket.on(
     SOCKET_EVENTS.MESSAGE_DELIVERED_ACK,
     async ({ channelId, messageId }) => {
       if (!channelId || !messageId) return;
-      // --- Use the token FROM THIS SOCKET'S CONTEXT (userToken) ---
-      // This 'userToken' belongs to the user whose client sent the ACK (the recipient)
-      console.log(
-        `Received delivery ACK from user ${userId} (socket ${socket.id}) for msg ${messageId}`
-      );
-      console.log(
-        `  Using recipient's token: ${
-          userToken ? userToken.substring(0, 10) + "..." : "MISSING!"
-        }`
-      );
+      const recipientUserId = socket.userData.id;
+      const recipientToken = socket.token;
 
-      if (!userToken) {
-        console.error(
-          `Delivery ACK Error: Token missing for user ${userId} on socket ${socket.id}`
-        );
-        // Optionally emit an error back? Generally just log server-side.
-        return;
+      if (!recipientToken) {
+        /* handle error */ return;
       }
-
       try {
         const phpPath = `/user/channels/${channelId}/messages/${messageId}/mark-delivered-at`;
-        // Make the PHP request using the recipient's token
-        const response = await makePhpRequest("put", phpPath, userToken);
+        const response = await makePhpRequest("put", phpPath, recipientToken);
 
         if (response.success) {
-          const deliveredAt =
-            response.data?.delivered_at || new Date().toISOString();
-          // Broadcast update
+          const deliveredAt = new Date().toISOString(); // <<< USE NODE'S TIME
+
           io.to(`channel_${channelId}`).emit(
             SOCKET_EVENTS.MESSAGE_STATUS_UPDATE,
             {
               channelId,
-              updates: [{ messageId, delivered_at: deliveredAt }],
+              updates: [{ messageId, delivered_at: deliveredAt }], // Broadcast standard update
             }
           );
         } else {
-          // Log specific PHP denial if possible
           console.warn(
-            `PHP denied marking msg ${messageId} delivered for user ${userId}: ${response.message}`
+            `[Socket ${socket.id}] PHP failed marking msg ${messageId} delivered: ${response.message}`
           );
         }
       } catch (error) {
-        console.error(
-          `Error in delivery ACK handling for msg ${messageId} by user ${userId}:`,
-          error.message
-        );
+        /* handle error */
       }
     }
   );
 
-  // --- Handle Read Acknowledgement from Client ---
-  socket.on("messageReadAck", async ({ channelId, messageId }) => {
-    // Correct event name
-    if (!channelId || !messageId) return;
-    // --- Use the token FROM THIS SOCKET'S CONTEXT (userToken) ---
-    // This 'userToken' belongs to the user whose client sent the ACK (the recipient)
-    console.log(
-      `Received read ACK from user ${userId} (socket ${socket.id}) for msg ${messageId}`
-    );
-    console.log(
-      `  Using recipient's token: ${
-        userToken ? userToken.substring(0, 10) + "..." : "MISSING!"
-      }`
-    );
+  // --- Single Message Read ACK Handler (Future Use) ---
+  socket.on(
+    SOCKET_EVENTS.MARK_MESSAGE_READ,
+    async ({ channelId, messageId }) => {
+      if (!channelId || !messageId) return;
+      const readerUserId = socket.userData.id;
+      const readerToken = socket.token;
 
-    if (!userToken) {
-      console.error(
-        `Read ACK Error: Token missing for user ${userId} on socket ${socket.id}`
-      );
-      return;
-    }
-
-    try {
-      const phpPath = `/user/channels/${channelId}/messages/${messageId}/mark-as-read`;
-      // Make the PHP request using the recipient's token
-      const response = await makePhpRequest("put", phpPath, userToken);
-
-      if (response.success) {
-        const readAt = response.data?.read_at || new Date().toISOString();
-        // Broadcast update
-        io.to(`channel_${channelId}`).emit(
-          SOCKET_EVENTS.MESSAGE_STATUS_UPDATE,
-          {
-            channelId,
-            updates: [{ messageId, read_at: readAt }],
-          }
-        );
-      } else {
-        console.warn(
-          `PHP denied marking msg ${messageId} read for user ${userId}: ${response.message}`
-        );
+      if (!readerToken) {
+        return;
       }
-    } catch (error) {
-      console.error(
-        `Error in read ACK handling for msg ${messageId} by user ${userId}:`,
-        error.message
-      );
-    }
-  });
+      try {
+        const phpPath = `/user/channels/${channelId}/messages/${messageId}/mark-as-read`;
+        const response = await makePhpRequest("put", phpPath, readerToken);
 
-  // --- Mark Channel Read Handler ---
+        if (response.success) {
+          const readAt = new Date().toISOString();
+          io.to(`channel_${channelId}`).emit(
+            SOCKET_EVENTS.MESSAGE_STATUS_UPDATE,
+            {
+              channelId,
+              updates: [{ messageId, read_at: readAt }], // Broadcast standard update
+            }
+          );
+        } else {
+          console.warn(
+            `[Socket ${socket.id}] PHP failed marking msg ${messageId} read: ${response.message}`
+          );
+        }
+      } catch (error) {
+        /* handle error */
+      }
+    }
+  );
+
+  // --- Mark Channel Delivered Handler (Bulk on Open) ---
+  socket.on(
+    SOCKET_EVENTS.MARK_CHANNEL_DELIVERED,
+    async ({ channelId }, callback) => {
+      // Use a specific log prefix for this handler instance
+      const socketId = socket.id;
+      const logPrefix = `[Socket ${socketId}][${SOCKET_EVENTS.MARK_CHANNEL_DELIVERED}][Chan ${channelId}]`;
+
+      // --- Argument Validation ---
+      if (typeof callback !== "function") {
+        console.error(
+          `${logPrefix} CRITICAL ERROR: Callback is not a function!`
+        );
+        return;
+      }
+      if (!channelId) {
+        console.warn(`${logPrefix} Missing channelId. Sending error callback.`);
+        return callback({ success: false, error: "Channel ID required" });
+      }
+      if (!userToken) {
+        console.error(
+          `${logPrefix} Missing userToken. Sending error callback.`
+        );
+        return callback({ success: false, error: "Auth token missing." });
+      }
+      // --- End Argument Validation ---
+
+      const recipientUserId = userId;
+      const recipientToken = userToken;
+
+      // ***** Wrap EVERYTHING in a top-level try...catch *****
+      try {
+        const phpPath = `/user/channels/${channelId}/mark-delivered-at`;
+
+        // Make PHP request within its own try...catch
+        let phpResponse;
+        try {
+          phpResponse = await makePhpRequest("put", phpPath, recipientToken);
+        } catch (phpError) {
+          console.error(
+            `${logPrefix} !!! EXCEPTION during PHP call: ${phpError.message}`
+          );
+          console.error(`${logPrefix} PHP Error Stack:`, phpError.stack); // Log stack trace
+          // Send error callback immediately if PHP call itself failed
+          return callback({
+            success: false,
+            error: `Failed to contact server: ${phpError.message}`,
+          });
+        }
+
+        if (phpResponse?.success) {
+          const deliveredAt = new Date().toISOString();
+          const actorUserId = recipientUserId;
+
+          // --- Broadcast Attempt ---
+          const broadcastData = {
+            channelId,
+            delivered_at: deliveredAt,
+            actorUserId: actorUserId,
+          };
+          try {
+            const jsonBroadcastData = JSON.stringify(
+              broadcastData,
+              safeStringify
+            );
+
+            io.to(`channel_${channelId}`).emit(
+              SOCKET_EVENTS.CHANNEL_BULK_DELIVERED_UPDATE,
+              broadcastData
+            );
+          } catch (broadcastError) {
+            console.error(
+              `${logPrefix} !!! EXCEPTION during broadcast emit/stringify: ${broadcastError.message}`
+            );
+            console.error(
+              `${logPrefix} Broadcast Error Stack:`,
+              broadcastError.stack
+            );
+            // Continue to callback even if broadcast fails, but log it
+          }
+          // --- End Broadcast Attempt ---
+
+          // --- Callback Attempt ---
+          const callbackData = { success: true };
+          try {
+            callback(callbackData); // Send success back
+          } catch (callbackError) {
+            console.error(
+              `${logPrefix} !!! EXCEPTION during success callback execution/stringify: ${callbackError.message}`
+            );
+            console.error(
+              `${logPrefix} Callback Error Stack:`,
+              callbackError.stack
+            );
+          }
+          // --- End Callback Attempt ---
+        } else {
+          const errorMsg =
+            phpResponse?.message || "PHP request indicated failure";
+          console.warn(
+            `${logPrefix} PHP failed marking channel delivered: ${errorMsg}`
+          );
+          // --- Error Callback Attempt ---
+          const errorCallbackData = { success: false, error: errorMsg };
+          try {
+            callback(errorCallbackData);
+          } catch (callbackError) {
+            console.error(
+              `${logPrefix} !!! EXCEPTION during error callback execution/stringify: ${callbackError.message}`
+            );
+            console.error(
+              `${logPrefix} Callback Error Stack:`,
+              callbackError.stack
+            );
+          }
+          // --- End Error Callback Attempt ---
+        }
+        // Catch exceptions from the outer logic (outside PHP call/broadcast/callback)
+      } catch (handlerError) {
+        console.error(
+          `${logPrefix} !!! TOP LEVEL EXCEPTION in handler: ${handlerError.message}`
+        );
+        console.error(`${logPrefix} Handler Error Stack:`, handlerError.stack);
+        // Try sending a generic error callback if possible
+        try {
+          callback({
+            success: false,
+            error: "Internal server error processing request.",
+          });
+        } catch (e) {
+          console.error(
+            `${logPrefix} Failed even to send generic error callback.`
+          );
+        }
+      } finally {
+        console.log(`${logPrefix} --- Handler End ---`);
+      }
+    }
+  );
+
+  // --- Mark Channel Read Handler (Bulk on Open) ---
   socket.on(
     SOCKET_EVENTS.MARK_CHANNEL_READ,
     async ({ channelId }, callback) => {
       if (!channelId)
         return callback({ success: false, error: "Channel ID required" });
-      // --- Use the token FROM THIS SOCKET'S CONTEXT (userToken) ---
-      // This 'userToken' belongs to the user opening the channel
-      console.log(
-        `User ${userId} (socket ${socket.id}) marking channel ${channelId} as read`
-      );
-      console.log(
-        `  Using user's token: ${
-          userToken ? userToken.substring(0, 10) + "..." : "MISSING!"
-        }`
-      );
+      const readerUserId = socket.userData.id;
+      const readerToken = socket.token;
 
-      if (!userToken) {
-        console.error(
-          `Mark Channel Read Error: Token missing for user ${userId} on socket ${socket.id}`
-        );
-        return callback({
+      if (!readerToken) {
+        /* handle error */ return callback({
           success: false,
-          error: "Authentication token missing on server.",
+          error: "Auth token missing.",
         });
       }
-
       try {
-        // Call PHP endpoint using the correct user's token
-        const response = await makePhpRequest(
-          "put",
-          `/user/channels/${channelId}/mark-as-read`,
-          userToken
-        );
+        const phpPath = `/user/channels/${channelId}/mark-as-read`; // Assumes bulk endpoint exists
+        const response = await makePhpRequest("put", phpPath, readerToken);
 
         if (response.success) {
-          const readAt = response.data?.read_at || new Date().toISOString();
-          const updatedMessageIds = response.data?.updated_ids || [];
-          console.log(
-            `Channel ${channelId} marked read by PHP for user ${userId}. Updated IDs: ${updatedMessageIds.length}`
-          );
+          const readAt = new Date().toISOString(); // <<< USE NODE'S TIME
 
-          // Broadcast CHANNEL_READ_UPDATE (for unread count)
+          // 1. Notify client about general read status (for unread count)
           io.to(`channel_${channelId}`).emit(
             SOCKET_EVENTS.CHANNEL_READ_UPDATE,
             {
               channelId,
-              readAt,
-              updatedMessageIds,
-              readerUserId: userId, // Optionally include who read it
+              readerUserId: readerUserId,
+              readAt: readAt, // Still useful to send timestamp here
             }
           );
 
-          // Broadcast individual updates if IDs provided
-          if (updatedMessageIds.length > 0) {
-            const updates = updatedMessageIds.map((id) => ({
-              messageId: id,
+          // 2. *** Broadcast BULK event ***
+          io.to(`channel_${channelId}`).emit(
+            SOCKET_EVENTS.CHANNEL_BULK_READ_UPDATE,
+            {
+              channelId,
               read_at: readAt,
-            }));
-            io.to(`channel_${channelId}`).emit(
-              SOCKET_EVENTS.MESSAGE_STATUS_UPDATE,
-              {
-                channelId,
-                updates,
-              }
-            );
-          }
+              actorUserId: readerUserId, // ID of the user whose action triggered this
+            }
+          );
           callback({ success: true });
         } else {
           console.warn(
-            `PHP denied marking channel ${channelId} read for user ${userId}: ${response.message}`
+            `[Socket ${socket.id}] PHP failed marking channel ${channelId} read: ${response.message}`
           );
           callback({
             success: false,
@@ -774,35 +843,19 @@ const registerSocketHandlers = (io, socket) => {
           });
         }
       } catch (error) {
-        console.error(
-          `Error marking channel ${channelId} read for user ${userId}:`,
-          error.message
-        );
-        callback({ success: false, error: error.message });
+        /* handle error */ callback({ success: false, error: error.message });
       }
     }
   );
 
-  // Add handlers for mark delivered, channel operations (create, update, delete, clear, mark all read etc.) following the same pattern:
-  // 1. Receive event from client
-  // 2. Call makePhpRequest with appropriate method, path, token, and data
-  // 3. Handle PHP response
-  // 4. Emit broadcast event (e.g., 'channelUpdated', 'chatCleared') to relevant rooms/users if needed
-  // 5. Send callback to the originating client
-
   // --- Disconnect ---
-
   socket.on("disconnect", (reason) => {
-    console.log(
-      `User ${userId} disconnected (${socket.id}). Reason: ${reason}`
-    );
     if (connectedUsers.get(userId) === socket.id) {
       connectedUsers.delete(userId);
     }
     socket.rooms.forEach((room) => {
       if (room.startsWith("channel_")) {
         socket.leave(room);
-        console.log(`Socket ${socket.id} left room ${room} on disconnect`);
       }
     });
 
@@ -811,9 +864,7 @@ const registerSocketHandlers = (io, socket) => {
       if (room.startsWith("channel_") && room !== socket.id) {
         // Check it's a channel room, not the socket's own room
         const channelId = room.substring("channel_".length);
-        console.log(
-          `User ${userId} disconnected, emitting stopTyping for channel ${channelId}`
-        );
+
         socket.to(room).emit(SOCKET_EVENTS.USER_STOPPED_TYPING, {
           channelId: parseInt(channelId, 10), // Ensure channelId is number if needed
           userId,

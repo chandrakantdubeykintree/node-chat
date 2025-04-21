@@ -50,13 +50,6 @@ const makePhpRequest = async (
     Authorization: `Bearer ${token}`,
     ...customHeaders, // Custom headers override defaults if keys match
   };
-  console.log(
-    `makePhpRequest (${method} ${path}): Sending Headers:`,
-    JSON.stringify({
-      ...phpApiClient.defaults.headers.common,
-      ...mergedHeaders,
-    })
-  ); // Log merged headers
 
   try {
     const requestConfig = {

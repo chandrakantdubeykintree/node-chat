@@ -5,7 +5,6 @@ const socketAuth = async (socket, next) => {
   const token = socket.handshake.auth.token; // Get token passed from client
 
   if (!token) {
-    console.error("Socket Auth Error: No token provided.");
     return next(new Error("Authentication error: No token provided."));
   }
 
@@ -14,10 +13,10 @@ const socketAuth = async (socket, next) => {
     // Attach user data and token to the socket object for later use
     socket.userData = userData;
     socket.token = token;
-    console.log(
-      `User ${userData.id} (${userData.username}) connected with socket ${socket.id}`
-    );
+
     next(); // Proceed with connection
+
+    socket.emit("authenticatedUserData", { user: userData }); // Use a specific event name
   } catch (error) {
     console.error(`Socket Auth Error: ${error.message}`);
     next(new Error(`Authentication error: ${error.message}`)); // Deny connection

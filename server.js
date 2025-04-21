@@ -34,7 +34,6 @@ io.use(socketAuth);
 io.on("connection", (socket) => {
   // Authentication was successful in middleware
   // socket.userData and socket.token are available here
-
   // Register all event handlers for this connected socket
   registerSocketHandlers(io, socket);
 });
