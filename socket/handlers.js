@@ -455,7 +455,7 @@ const registerSocketHandlers = (io, socket) => {
   socket.on(
     "createChannel",
     async (
-      { userIds, is_group, name = null, description = null /* other fields */ },
+      { userIds, is_group, name = null, description = null, thumbnail_image },
       callback
     ) => {
       const userId = socket.userData.id;
@@ -493,7 +493,9 @@ const registerSocketHandlers = (io, socket) => {
           formData.append("description", description);
         }
         // Handle thumbnail_image if needed for group creation (requires file upload logic first)
-        // if (thumbnail_image_file) { formData.append('thumbnail_image', ...); }
+        // if (thumbnail_image) {
+        //   formData.append("thumbnail_image", thumbnail_image);
+        // }
 
         const phpUrl = "/user/channels";
 
@@ -844,6 +846,293 @@ const registerSocketHandlers = (io, socket) => {
         }
       } catch (error) {
         /* handle error */ callback({ success: false, error: error.message });
+      }
+    }
+  );
+
+  socket.on("leaveGroup", async ({ channelId }, callback) => {
+    const socketId = socket.id;
+    const logPrefix = `[Socket ${socketId}][leaveGroup][Chan ${channelId}]`;
+
+    if (typeof callback !== "function")
+      return console.error(`${logPrefix} Callback is not a function!`);
+    if (!channelId)
+      return callback({ success: false, error: "Channel ID required" });
+    if (!userToken)
+      return callback({ success: false, error: "Auth token missing." });
+
+    try {
+      // Call PHP endpoint: /user/channels/:channelId/left-chat
+      // Method might be DELETE or PUT depending on your PHP API design
+      // Let's assume DELETE for leaving/removing association
+      const phpPath = `/user/channels/${channelId}/left-chat`;
+
+      let phpResponse;
+      try {
+        // Assuming DELETE method for leaving
+        phpResponse = await makePhpRequest("put", phpPath, userToken);
+      } catch (phpError) {
+        console.error(
+          `${logPrefix} !!! EXCEPTION during PHP call: ${phpError.message}`
+        );
+        return callback({
+          success: false,
+          error: `Failed to contact server: ${phpError.message}`,
+        });
+      }
+
+      if (phpResponse?.success) {
+        // 1. Force the leaving user's socket out of the room
+        socket.leave(`channel_${channelId}`);
+        console.log(`${logPrefix} User ${userId} left room.`);
+
+        // 2. Notify remaining members in the room
+        const leaveUpdateData = {
+          channelId,
+          userId: userId, // ID of the user who left
+          userName: userName, // Name of the user who left
+          message: `${userName} left the group.`, // Optional system message idea
+          // You might receive updated channel data from PHP (e.g., new participant count)
+          // updatedChannelData: phpResponse.data // If PHP returns it
+        };
+        // Emit an event specifically for user leaving
+        socket
+          .to(`channel_${channelId}`)
+          .emit("userLeftGroup", leaveUpdateData);
+        // OR emit a generic channel update if PHP returns full updated channel data
+        // if (leaveUpdateData.updatedChannelData) {
+        //    io.to(`channel_${channelId}`).emit("channelUpdated", { channelData: leaveUpdateData.updatedChannelData });
+        // }
+
+        // 3. Send success callback to the leaving user
+        callback({ success: true });
+
+        // 4. Tell the leaving user's client to remove the channel (alternative to relying on leave room)
+        // This ensures removal even if other events are missed.
+        socket.emit("channelDeleted", { channelId });
+      } else {
+        const errorMsg =
+          phpResponse?.message || "PHP request indicated failure";
+        console.warn(`${logPrefix} PHP failed leaving group: ${errorMsg}`);
+        callback({ success: false, error: errorMsg });
+      }
+    } catch (handlerError) {
+      console.error(
+        `${logPrefix} !!! TOP LEVEL EXCEPTION in handler: ${handlerError.message}`
+      );
+      try {
+        callback({ success: false, error: "Internal server error." });
+      } catch (e) {
+        /* ignore */
+      }
+    }
+  });
+
+  socket.on(
+    "updateChannelInfo",
+    async ({ channelId, name, description, thumbnail_image }, callback) => {
+      const socketId = socket.id;
+      const logPrefix = `[Socket ${socketId}][updateChannelInfo][Chan ${channelId}]`;
+
+      if (typeof callback !== "function")
+        return console.error(`${logPrefix} Callback is not a function!`);
+      if (!channelId)
+        return callback({ success: false, error: "Channel ID required" });
+      if (!userToken)
+        return callback({ success: false, error: "Auth token missing." });
+      // Basic validation: At least one field must be intended for update, though PHP will handle specifics.
+      if (
+        name === undefined &&
+        description === undefined &&
+        thumbnail_image === undefined
+      ) {
+        return callback({ success: false, error: "No update data provided." });
+      }
+
+      console.log(`${logPrefix} Received update request:`, {
+        name,
+        description,
+        thumbnail_image,
+      });
+
+      try {
+        // PHP endpoint: PUT /user/channels/:channelId
+        // We need to send FormData because thumbnail_image might be involved,
+        // and PHP likely expects form data for PUT/POST with potential file IDs.
+        const formData = new FormData();
+        formData.append("_method", "PUT"); // Method override for PHP frameworks
+
+        // Append fields *only if they are provided* in the request
+        // Check for `null` explicitly if you want to allow clearing fields.
+        // Check for `undefined` to only send fields the client intended to update.
+        if (name !== undefined) {
+          formData.append("name", name || ""); // Send empty string if null/undefined to potentially clear
+        }
+        if (description !== undefined) {
+          // Send empty string or a special value if PHP expects it to clear the description
+          formData.append("description", description || "");
+        }
+        if (thumbnail_image !== undefined) {
+          // Send the ID, or potentially '0' or an empty string if PHP expects that to clear the image
+          formData.append(
+            "thumbnail_image",
+            thumbnail_image ? thumbnail_image.toString() : ""
+          );
+        }
+
+        const phpPath = `/user/channels/${channelId}`;
+
+        // Use raw axios client for FormData
+        const response = await phpApiClient.post(phpPath, formData, {
+          // POST with _method=PUT
+          headers: {
+            ...formData.getHeaders(),
+            Authorization: `Bearer ${userToken}`,
+            "x-api-key": config.phpApiKey || "",
+          },
+        });
+
+        console.log(`${logPrefix} PHP Response:`, response.data);
+
+        if (response.data && response.data.success) {
+          const updatedChannelData = response.data.data; // Assuming PHP returns the full updated channel
+
+          // Broadcast the update to all members of the channel room
+          io.to(`channel_${channelId}`).emit("channelUpdated", {
+            channelId: channelId,
+            channelData: updatedChannelData,
+          });
+          console.log(`${logPrefix} Emitted 'channelUpdated'`);
+
+          callback({ success: true, channel: updatedChannelData }); // Confirm success to the sender
+        } else {
+          console.warn(
+            `${logPrefix} PHP update failed: ${response.data?.message}`
+          );
+          callback({
+            success: false,
+            error: response.data?.message || "Failed to update group info",
+          });
+        }
+      } catch (error) {
+        console.error(
+          `${logPrefix} !!! EXCEPTION during PHP call: ${error.message}`
+        );
+        console.error(`${logPrefix} PHP Error Status:`, error.response?.status);
+        console.error(`${logPrefix} PHP Error Response:`, error.response?.data);
+        callback({
+          success: false,
+          error: error.response?.data?.message || "Failed to update group info",
+        });
+      }
+    }
+  );
+
+  socket.on(
+    "addMembersToGroup",
+    async ({ channelId, userIdsToAdd, name }, callback) => {
+      const socketId = socket.id;
+      const logPrefix = `[Socket ${socketId}][addMembers][Chan ${channelId}]`;
+
+      // --- Validation ---
+      if (typeof callback !== "function")
+        return console.error(`${logPrefix} Callback missing!`);
+      if (!channelId)
+        return callback({ success: false, error: "Channel ID required" });
+      if (!userToken)
+        return callback({ success: false, error: "Auth token missing." });
+      if (!Array.isArray(userIdsToAdd) || userIdsToAdd.length === 0) {
+        return callback({ success: false, error: "User IDs array required." });
+      }
+      // --- End Validation ---
+
+      console.log(`${logPrefix} Received request to add users:`, userIdsToAdd);
+
+      try {
+        // --- Call PHP ---
+        const formData = new FormData();
+        userIdsToAdd.forEach((id) =>
+          formData.append("user_ids[]", id.toString())
+        );
+        formData.append("_method", "PUT"); // Method override for PHP
+        formData.append("name", name || "");
+        const phpPath = `/user/channels/${channelId}`;
+
+        const response = await phpApiClient.post(phpPath, formData, {
+          headers: {
+            /* ... FormData headers + Auth ... */ ...formData.getHeaders(),
+            Authorization: `Bearer ${userToken}`,
+            "x-api-key": config.phpApiKey || "",
+          },
+        });
+        // --- End Call PHP ---
+
+        console.log(`${logPrefix} PHP Response:`, response.data);
+
+        if (response.data && response.data.success) {
+          const updatedChannelData = response.data.data; // <-- Expect full channel data
+
+          // --- Notify & Update ---
+          if (!updatedChannelData || !updatedChannelData.users) {
+            console.error(
+              `${logPrefix} PHP success but missing updated channel data or users array!`
+            );
+            // Fallback: Send success but maybe warn client?
+            // Or treat as failure? For now, proceed but log error.
+            // return callback({ success: false, error: "Server error: Incomplete update data." });
+          }
+
+          // Make newly added users join the Socket.IO room
+          userIdsToAdd.forEach((newUserId) => {
+            const newUserSocketId = connectedUsers.get(newUserId);
+            if (newUserSocketId) {
+              const newUserSocket = io.sockets.sockets.get(newUserSocketId);
+              if (newUserSocket) {
+                newUserSocket.join(`channel_${channelId}`);
+                console.log(
+                  `${logPrefix} Made new user ${newUserId} join room.`
+                );
+                // Notify the newly added user they were added
+                // Send the *full* channel data so their list updates correctly
+                newUserSocket.emit("channelUpdated", {
+                  channelId: channelId,
+                  channelData: updatedChannelData,
+                });
+              }
+            }
+          });
+
+          // Broadcast the full channel update to everyone *already* in the room
+          socket.to(`channel_${channelId}`).emit("channelUpdated", {
+            // Use socket.to to exclude sender initially
+            channelId: channelId,
+            channelData: updatedChannelData,
+          });
+          console.log(
+            `${logPrefix} Emitted 'channelUpdated' after adding members.`
+          );
+
+          callback({ success: true, channel: updatedChannelData }); // Send success back to caller
+        } else {
+          console.warn(
+            `${logPrefix} PHP add members failed: ${response.data?.message}`
+          );
+          callback({
+            success: false,
+            error: response.data?.message || "Failed to add members",
+          });
+        }
+      } catch (error) {
+        // ... Error handling ...
+        console.error(
+          `${logPrefix} !!! EXCEPTION during PHP call: ${error.message}`
+        );
+        console.error(`${logPrefix} PHP Error Status:`, error.response?.status);
+        console.error(`${logPrefix} PHP Error Response:`, error.response?.data);
+        callback({
+          success: false,
+          error: error.response?.data?.message || "Failed to add members",
+        });
       }
     }
   );
