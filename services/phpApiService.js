@@ -34,6 +34,38 @@ const validateToken = async (token) => {
   }
 };
 
+const updatePhpOnlineStatus = async (token, isOnline) => {
+  if (!token) {
+    console.error("updatePhpOnlineStatus: Token is required.");
+    // Throw or return an error indicator based on how you want to handle it
+    throw new Error("Authentication token missing for status update.");
+  }
+  try {
+    console.log(
+      `[Node Service] Calling PHP PUT /user/change-online-status with is_online: ${isOnline}`
+    );
+    // Using makePhpRequest helper which includes auth header
+    const responseData = await makePhpRequest(
+      "put", // Use PUT method
+      "/user/change-online-status",
+      token,
+      { is_online: isOnline } // Send JSON payload
+    );
+
+    // Assuming PHP response structure: { success: true, message: "...", data: { last_seen_at: "..." } } (when going offline)
+    console.log(`[Node Service] PHP update status response:`, responseData);
+    return responseData; // Return the full response
+  } catch (error) {
+    // Log the specific error from the PHP call
+    console.error(
+      `[Node Service] Failed to update PHP online status to ${isOnline}:`,
+      error.message
+    );
+    // Re-throw or return an error structure
+    throw error; // Let the caller handle the error
+  }
+};
+
 // Function to make generic requests to PHP backend
 const makePhpRequest = async (
   method,
@@ -75,4 +107,5 @@ module.exports = {
   validateToken,
   makePhpRequest,
   phpApiClient, // Export client if needed for direct FormData use elsewhere
+  updatePhpOnlineStatus,
 };

@@ -1,5 +1,9 @@
 // node-server/socket/handlers.js
-const { makePhpRequest, phpApiClient } = require("../services/phpApiService");
+const {
+  makePhpRequest,
+  phpApiClient,
+  updatePhpOnlineStatus,
+} = require("../services/phpApiService");
 const FormData = require("form-data"); // If sending FormData from Node
 
 const config = require("../config");
@@ -34,26 +38,55 @@ const safeStringify = (key, value) => {
 
 // Store connected users { userId: socketId } - simplistic, refine for multiple connections per user if needed
 const connectedUsers = new Map();
+// --- Export IO instance ---
+let ioRef = null;
+const getIoInstance = () => ioRef;
 
 const registerSocketHandlers = (io, socket) => {
+  ioRef = io; // Store io instance
   const userId = socket.userData.id;
   const userToken = socket.token; // Use token associated with this specific socket
 
   const userName =
     socket.userData.profile?.first_name || socket.userData.username; // Get user's name
 
-  // Store user connection
-  connectedUsers.set(userId, socket.id);
-  // TODO: Emit presence update if needed
-
+  // --- Handle User Connection ---
   if (!connectedUsers.has(userId)) {
-    // Could store multiple socket IDs if needed
-    connectedUsers.set(userId, socket.id);
-  } else {
-    // Handle cases where user might connect from multiple devices/tabs if needed
+    connectedUsers.set(userId, new Set());
+  }
+  const userSockets = connectedUsers.get(userId);
+  const isFirstConnection = userSockets.size === 0;
+  userSockets.add(socket.id);
+  console.log(
+    `User ${userId} connected with socket ${socket.id}. Total sockets: ${userSockets.size}`
+  );
 
-    // Update the map or store multiple IDs per user
-    connectedUsers.set(userId, socket.id); // Simple override for now
+  if (isFirstConnection) {
+    updatePhpOnlineStatus(userToken, true)
+      .then((phpResponse) => {
+        // Check if the user is still connected when the response comes back
+        if (connectedUsers.has(userId)) {
+          console.log(
+            `PHP status updated to online for ${userId}. Broadcasting userOnline.`
+          );
+          io.emit("userOnline", { userId });
+        } else {
+          console.log(
+            `User ${userId} disconnected before PHP online update finished.`
+          );
+        }
+      })
+      .catch((error) => {
+        console.error(
+          `Failed to update PHP status to online for ${userId}: ${error.message}`
+        );
+        // Optionally still broadcast userOnline optimistically? Or handle error?
+        // For now, let's still broadcast so clients *might* see the status change
+        if (connectedUsers.has(userId)) {
+          // Check again before optimistic broadcast
+          io.emit("userOnline", { userId });
+        }
+      });
   }
 
   // --- Channel Handling ---
@@ -62,70 +95,19 @@ const registerSocketHandlers = (io, socket) => {
     const socketId = socket.id; // Capture socket ID for logging
     try {
       const response = await makePhpRequest("get", "/user/channels", userToken);
-
       if (response?.success) {
-        const channelsData = response.data || []; // Ensure it's an array
-
-        // --- Log EXACT Data Sent to Client (CRITICAL) ---
-        const callbackData = { success: true, channels: channelsData };
-        try {
-          // Use safeStringify here!
-          const jsonData = JSON.stringify(callbackData, safeStringify);
-        } catch (stringifyError) {
-          console.error(
-            `[Socket ${socketId}] !!! Failed to stringify getChannels callback data: ${stringifyError.message}`
-          );
-          console.error(
-            `[Socket ${socketId}] Problematic callbackData object:`,
-            callbackData
-          );
-          // Don't send potentially broken data back
-          callback({
-            success: false,
-            error: "Internal server error processing channel data.",
-          });
-          return; // Stop execution for this handler
-        }
-        // --- End Log EXACT Data ---
-
-        // Join rooms (keep this logic)
+        const channelsData = response.data || [];
+        // Join rooms etc.
         channelsData.forEach((channel) => {
-          // Check if channel and channel.id exist before joining
-          if (
-            channel &&
-            typeof channel.id !== "undefined" &&
-            channel.id !== null
-          ) {
-            socket.join(`channel_${channel.id}`);
-          } else {
-            console.warn(
-              `[Socket ${socketId}] Skipping join for invalid channel object in getChannels response:`,
-              channel
-            );
-          }
+          if (channel?.id) socket.join(`channel_${channel.id}`);
         });
-
-        // Execute Callback
-        callback(callbackData);
+        callback({ success: true, channels: channelsData });
+        // *** REMOVE the userOnline emit from here ***
       } else {
-        console.error(
-          `[Socket ${socketId}] PHP failed fetching channels: ${response?.message}`
-        );
-        const errorCallbackData = {
-          success: false,
-          error: response?.message || "Failed to fetch channels",
-        };
-
-        callback(errorCallbackData);
+        callback({ success: false, error: response?.message || "Failed" });
       }
     } catch (error) {
-      console.error(
-        `[Socket ${socketId}] Error fetching/processing channels:`,
-        error.message
-      );
-      const exceptionCallbackData = { success: false, error: error.message };
-
-      callback(exceptionCallbackData);
+      callback({ success: false, error: error.message });
     }
   });
 
@@ -1138,31 +1120,63 @@ const registerSocketHandlers = (io, socket) => {
   );
 
   // --- Disconnect ---
+  // --- Disconnect Handler (Revised for Online Status) ---
   socket.on("disconnect", (reason) => {
-    if (connectedUsers.get(userId) === socket.id) {
-      connectedUsers.delete(userId);
-    }
-    socket.rooms.forEach((room) => {
-      if (room.startsWith("channel_")) {
-        socket.leave(room);
-      }
-    });
+    console.log(
+      `Socket ${socket.id} for user ${userId} disconnected. Reason: ${reason}`
+    );
 
-    // Also emit stopTyping for all rooms the user was potentially typing in
+    if (connectedUsers.has(userId)) {
+      const userSockets = connectedUsers.get(userId);
+      userSockets.delete(socket.id);
+
+      // If this was the LAST socket, update PHP status to offline
+      if (userSockets.size === 0) {
+        connectedUsers.delete(userId); // Remove user entry
+        console.log(
+          `User ${userId} fully disconnected. Updating PHP status to offline.`
+        );
+
+        updatePhpOnlineStatus(userToken, false) // Use the token from the disconnecting socket
+          .then((phpResponse) => {
+            // Extract lastSeen from PHP response if available, otherwise use Node time
+            const lastSeen =
+              phpResponse?.data?.last_seen_at || new Date().toISOString();
+            console.log(
+              `PHP status updated to offline for ${userId}. Broadcasting userOffline.`
+            );
+            io.emit("userOffline", { userId, lastSeen }); // Broadcast with timestamp
+          })
+          .catch((error) => {
+            console.error(
+              `Failed to update PHP status to offline for ${userId}: ${error.message}`
+            );
+            // Broadcast userOffline optimistically with Node time as fallback
+            const lastSeenFallback = new Date().toISOString();
+            io.emit("userOffline", { userId, lastSeen: lastSeenFallback });
+          });
+      } else {
+        console.log(
+          `User ${userId} still has ${userSockets.size} active sockets.`
+        );
+      }
+    } else {
+      console.warn(
+        `User ${userId} not found in connectedUsers map during disconnect.`
+      );
+    }
+
+    // Clean up typing indicators etc. (Keep this)
     socket.rooms.forEach((room) => {
       if (room.startsWith("channel_") && room !== socket.id) {
-        // Check it's a channel room, not the socket's own room
         const channelId = room.substring("channel_".length);
-
         socket.to(room).emit(SOCKET_EVENTS.USER_STOPPED_TYPING, {
-          channelId: parseInt(channelId, 10), // Ensure channelId is number if needed
+          channelId: parseInt(channelId, 10),
           userId,
         });
       }
     });
-    // TODO: Emit presence update if needed (user went offline)
-    // Clean up any other user-specific resources if necessary
   });
 };
 
-module.exports = { registerSocketHandlers };
+module.exports = { registerSocketHandlers, getIoInstance };
