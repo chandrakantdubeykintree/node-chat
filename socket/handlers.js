@@ -437,7 +437,7 @@ const registerSocketHandlers = (io, socket) => {
   socket.on(
     "createChannel",
     async (
-      { userIds, is_group, name = null, description = null, thumbnail_image },
+      { userIds, is_group, name = null, description = null, attachment_id },
       callback
     ) => {
       const userId = socket.userData.id;
@@ -474,10 +474,10 @@ const registerSocketHandlers = (io, socket) => {
         if (description) {
           formData.append("description", description);
         }
-        // Handle thumbnail_image if needed for group creation (requires file upload logic first)
-        // if (thumbnail_image) {
-        //   formData.append("thumbnail_image", thumbnail_image);
-        // }
+        // Handle attachment_id if needed for group creation (requires file upload logic first)
+        if (attachment_id) {
+          formData.append("attachment_id", attachment_id);
+        }
 
         const phpUrl = "/user/channels";
 
@@ -912,7 +912,7 @@ const registerSocketHandlers = (io, socket) => {
 
   socket.on(
     "updateChannelInfo",
-    async ({ channelId, name, description, thumbnail_image }, callback) => {
+    async ({ channelId, name, description, attachment_id }, callback) => {
       const socketId = socket.id;
       const logPrefix = `[Socket ${socketId}][updateChannelInfo][Chan ${channelId}]`;
 
@@ -926,7 +926,7 @@ const registerSocketHandlers = (io, socket) => {
       if (
         name === undefined &&
         description === undefined &&
-        thumbnail_image === undefined
+        attachment_id === undefined
       ) {
         return callback({ success: false, error: "No update data provided." });
       }
@@ -934,12 +934,12 @@ const registerSocketHandlers = (io, socket) => {
       console.log(`${logPrefix} Received update request:`, {
         name,
         description,
-        thumbnail_image,
+        attachment_id,
       });
 
       try {
         // PHP endpoint: PUT /user/channels/:channelId
-        // We need to send FormData because thumbnail_image might be involved,
+        // We need to send FormData because attachment_id might be involved,
         // and PHP likely expects form data for PUT/POST with potential file IDs.
         const formData = new FormData();
         formData.append("_method", "PUT"); // Method override for PHP frameworks
@@ -954,11 +954,11 @@ const registerSocketHandlers = (io, socket) => {
           // Send empty string or a special value if PHP expects it to clear the description
           formData.append("description", description || "");
         }
-        if (thumbnail_image !== undefined) {
+        if (attachment_id !== undefined) {
           // Send the ID, or potentially '0' or an empty string if PHP expects that to clear the image
           formData.append(
-            "thumbnail_image",
-            thumbnail_image ? thumbnail_image.toString() : ""
+            "attachment_id",
+            attachment_id ? attachment_id.toString() : ""
           );
         }
 
