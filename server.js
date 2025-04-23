@@ -8,12 +8,13 @@ const socketAuth = require("./middleware/socketAuth");
 const { registerSocketHandlers } = require("./socket/handlers");
 
 const app = express();
+app.set("trust proxy", 1);
 const server = http.createServer(app);
 // Express middleware
 app.use(
   cors({
     // origin: config.frontendUrl,
-    origin: ["*", "http://localhost:3000", "https://kintree.info"],
+    origin: ["*", "http://localhost:3000/", "https://kintree.info/"],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
@@ -26,14 +27,21 @@ app.use(express.json()); // If you add any standard Express routes
 const io = new Server(server, {
   cors: {
     // origin: config.allowedOrigin, // Allow React frontend
-    origin: ["*", "http://localhost:3000", "https://kintree.info"],
+    origin: ["*", "http://localhost:3000/", "https://kintree.info/"],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
     exposedHeaders: ["Access-Control-Allow-Origin"],
+    credentials: true,
   },
   path: "/socket.io/",
   pingTimeout: 60000,
   pingInterval: 25000,
+});
+
+app.get("/", (req, res) => {
+  console.log("baru hit root");
+  console.log(io);
+  res.send("Hello World");
 });
 
 // Health check endpoint (optional)
@@ -46,6 +54,8 @@ io.use(socketAuth);
 
 // Handle Socket.IO Connections
 io.on("connection", (socket) => {
+  console.log("connection established");
+
   // Authentication was successful in middleware
   // socket.userData and socket.token are available here
   // Register all event handlers for this connected socket
