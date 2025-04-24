@@ -57,18 +57,12 @@ const registerSocketHandlers = (io, socket) => {
   const userSockets = connectedUsers.get(userId);
   const isFirstConnection = userSockets.size === 0;
   userSockets.add(socket.id);
-  console.log(
-    `User ${userId} connected with socket ${socket.id}. Total sockets: ${userSockets.size}`
-  );
 
   if (isFirstConnection) {
     updatePhpOnlineStatus(userToken, true)
       .then((phpResponse) => {
         // Check if the user is still connected when the response comes back
         if (connectedUsers.has(userId)) {
-          console.log(
-            `PHP status updated to online for ${userId}. Broadcasting userOnline.`
-          );
           io.emit("userOnline", { userId });
         } else {
           console.log(
@@ -866,7 +860,6 @@ const registerSocketHandlers = (io, socket) => {
       if (phpResponse?.success) {
         // 1. Force the leaving user's socket out of the room
         socket.leave(`channel_${channelId}`);
-        console.log(`${logPrefix} User ${userId} left room.`);
 
         // 2. Notify remaining members in the room
         const leaveUpdateData = {
@@ -931,12 +924,6 @@ const registerSocketHandlers = (io, socket) => {
         return callback({ success: false, error: "No update data provided." });
       }
 
-      console.log(`${logPrefix} Received update request:`, {
-        name,
-        description,
-        attachment_id,
-      });
-
       try {
         // PHP endpoint: PUT /user/channels/:channelId
         // We need to send FormData because attachment_id might be involved,
@@ -974,8 +961,6 @@ const registerSocketHandlers = (io, socket) => {
           },
         });
 
-        console.log(`${logPrefix} PHP Response:`, response.data);
-
         if (response.data && response.data.success) {
           const updatedChannelData = response.data.data; // Assuming PHP returns the full updated channel
 
@@ -984,7 +969,6 @@ const registerSocketHandlers = (io, socket) => {
             channelId: channelId,
             channelData: updatedChannelData,
           });
-          console.log(`${logPrefix} Emitted 'channelUpdated'`);
 
           callback({ success: true, channel: updatedChannelData }); // Confirm success to the sender
         } else {
@@ -1012,108 +996,230 @@ const registerSocketHandlers = (io, socket) => {
 
   socket.on(
     "addMembersToGroup",
-    async ({ channelId, userIdsToAdd, name }, callback) => {
+    async ({ channelId, userIdsToAdd }, callback) => {
+      // Removed 'name' - channel name shouldn't be sent here unless PHP needs it
       const socketId = socket.id;
       const logPrefix = `[Socket ${socketId}][addMembers][Chan ${channelId}]`;
+      const requesterUserId = userId; // User performing the action
+      const requesterToken = userToken;
 
       // --- Validation ---
       if (typeof callback !== "function")
         return console.error(`${logPrefix} Callback missing!`);
       if (!channelId)
         return callback({ success: false, error: "Channel ID required" });
-      if (!userToken)
+      if (!requesterToken)
         return callback({ success: false, error: "Auth token missing." });
       if (!Array.isArray(userIdsToAdd) || userIdsToAdd.length === 0) {
         return callback({ success: false, error: "User IDs array required." });
       }
       // --- End Validation ---
 
-      console.log(`${logPrefix} Received request to add users:`, userIdsToAdd);
-
       try {
-        // --- Call PHP ---
-        const formData = new FormData();
-        userIdsToAdd.forEach((id) =>
-          formData.append("user_ids[]", id.toString())
-        );
-        formData.append("_method", "PUT"); // Method override for PHP
-        formData.append("name", name || "");
-        const phpPath = `/user/channels/${channelId}`;
+        // --- Call PHP using makePhpRequest with JSON ---
+        const phpPath = `/user/channels/${channelId}/add-users`;
+        const payload = { user_ids: userIdsToAdd }; // Send JSON payload
 
-        const response = await phpApiClient.post(phpPath, formData, {
-          headers: {
-            /* ... FormData headers + Auth ... */ ...formData.getHeaders(),
-            Authorization: `Bearer ${userToken}`,
-            "x-api-key": config.phpApiKey || "",
-          },
-        });
+        // Use 'put' or 'post' based on your PHP API design for adding users
+        // Let's assume PUT for consistency with how you structured the request before
+        const phpResponse = await makePhpRequest(
+          "post", // Or "post" if PHP expects that
+          phpPath,
+          requesterToken,
+          payload, // Send JSON data directly
+          { "Content-Type": "application/json" } // Explicitly set Content-Type for JSON
+        );
         // --- End Call PHP ---
 
-        console.log(`${logPrefix} PHP Response:`, response.data);
+        if (phpResponse && phpResponse.success) {
+          const updatedChannelData = phpResponse.data; // <-- Expect full channel data
 
-        if (response.data && response.data.success) {
-          const updatedChannelData = response.data.data; // <-- Expect full channel data
-
-          // --- Notify & Update ---
-          if (!updatedChannelData || !updatedChannelData.users) {
+          // --- Basic Check on Response Data ---
+          if (
+            !updatedChannelData ||
+            !updatedChannelData.id ||
+            !Array.isArray(updatedChannelData.users)
+          ) {
             console.error(
-              `${logPrefix} PHP success but missing updated channel data or users array!`
+              `${logPrefix} PHP success but response data is incomplete/invalid.`
             );
-            // Fallback: Send success but maybe warn client?
-            // Or treat as failure? For now, proceed but log error.
-            // return callback({ success: false, error: "Server error: Incomplete update data." });
+            // Decide how to handle: maybe return success but warn, or treat as error
+            return callback({
+              success: false,
+              error:
+                "Server error: Incomplete update data received from backend.",
+            });
           }
+          // --- End Basic Check ---
 
-          // Make newly added users join the Socket.IO room
-          userIdsToAdd.forEach((newUserId) => {
-            const newUserSocketId = connectedUsers.get(newUserId);
-            if (newUserSocketId) {
-              const newUserSocket = io.sockets.sockets.get(newUserSocketId);
-              if (newUserSocket) {
-                newUserSocket.join(`channel_${channelId}`);
-                console.log(
-                  `${logPrefix} Made new user ${newUserId} join room.`
-                );
-                // Notify the newly added user they were added
-                // Send the *full* channel data so their list updates correctly
-                newUserSocket.emit("channelUpdated", {
-                  channelId: channelId,
-                  channelData: updatedChannelData,
+          // --- Notify & Update Sockets ---
+          const newMemberIds = new Set(userIdsToAdd); // For quick lookup
+
+          // 1. Make newly added ONLINE users join the Socket.IO room
+          // 2. Notify newly added ONLINE users they've been added (send full channel data)
+          updatedChannelData.users.forEach((user) => {
+            if (newMemberIds.has(user.id)) {
+              const userSockets = connectedUsers.get(user.id); // Get Set of sockets for the user
+              if (userSockets && userSockets.size > 0) {
+                userSockets.forEach((targetSocketId) => {
+                  const targetSocket = io.sockets.sockets.get(targetSocketId);
+                  if (targetSocket) {
+                    targetSocket.join(`channel_${channelId}`);
+
+                    // Send the full channel data so their list/view updates correctly
+                    targetSocket.emit("channelUpdated", {
+                      // Use the standard update event
+                      channelId: channelId,
+                      channelData: updatedChannelData,
+                      message: `You were added to the group "${updatedChannelData.name}"`, // Optional notification message
+                    });
+                  }
                 });
               }
             }
           });
 
-          // Broadcast the full channel update to everyone *already* in the room
-          socket.to(`channel_${channelId}`).emit("channelUpdated", {
-            // Use socket.to to exclude sender initially
+          // 3. Broadcast the full channel update to EVERYONE now in the room (including the new members and the person who added them)
+          io.to(`channel_${channelId}`).emit("channelUpdated", {
             channelId: channelId,
             channelData: updatedChannelData,
           });
-          console.log(
-            `${logPrefix} Emitted 'channelUpdated' after adding members.`
-          );
 
-          callback({ success: true, channel: updatedChannelData }); // Send success back to caller
+          // 4. Send success callback to the original requester
+          callback({ success: true, channel: updatedChannelData });
         } else {
-          console.warn(
-            `${logPrefix} PHP add members failed: ${response.data?.message}`
-          );
-          callback({
-            success: false,
-            error: response.data?.message || "Failed to add members",
-          });
+          const errorMsg =
+            phpResponse?.message || "PHP request indicated failure";
+          console.warn(`${logPrefix} PHP add members failed: ${errorMsg}`);
+          callback({ success: false, error: errorMsg });
         }
       } catch (error) {
-        // ... Error handling ...
-        console.error(
-          `${logPrefix} !!! EXCEPTION during PHP call: ${error.message}`
-        );
-        console.error(`${logPrefix} PHP Error Status:`, error.response?.status);
-        console.error(`${logPrefix} PHP Error Response:`, error.response?.data);
+        console.error(`${logPrefix} !!! EXCEPTION: ${error.message}`);
+        // Log detailed error if available (e.g., from axios)
+        if (error.response) {
+          console.error(
+            `${logPrefix} PHP Error Status:`,
+            error.response.status
+          );
+          console.error(
+            `${logPrefix} PHP Error Response:`,
+            error.response.data
+          );
+        } else {
+          console.error(error); // Log the whole error object for other cases
+        }
         callback({
           success: false,
-          error: error.response?.data?.message || "Failed to add members",
+          error:
+            error.response?.data?.message ||
+            error.message ||
+            "Failed to add members due to server error",
+        });
+      }
+    }
+  );
+
+  socket.on(
+    "removeMembersFromGroup",
+    async ({ channelId, userIdsToRemove }, callback) => {
+      const socketId = socket.id;
+      const logPrefix = `[Socket ${socketId}][removeMembers][Chan ${channelId}]`;
+      const requesterUserId = userId;
+      const requesterToken = userToken;
+
+      // --- Validation (Keep as is) ---
+      if (typeof callback !== "function")
+        return console.error(`${logPrefix} Callback missing!`);
+      if (!channelId)
+        return callback({ success: false, error: "Channel ID required" });
+      if (!requesterToken)
+        return callback({ success: false, error: "Auth token missing." });
+      if (!Array.isArray(userIdsToRemove) || userIdsToRemove.length === 0) {
+        return callback({ success: false, error: "User IDs array required." });
+      }
+      if (userIdsToRemove.includes(requesterUserId)) {
+        return callback({
+          success: false,
+          error:
+            "You cannot remove yourself using this action. Use 'Leave Group'.",
+        });
+      }
+      // --- End Validation ---
+
+      try {
+        // --- Call PHP (Endpoint might be POST or DELETE, adjust method) ---
+        const phpPath = `/user/channels/${channelId}/remove-users`;
+        const payload = { user_ids: userIdsToRemove };
+        const phpResponse = await makePhpRequest(
+          "post", // <-- Ensure this method matches your PHP API (POST or PUT or DELETE)
+          phpPath,
+          requesterToken,
+          payload,
+          { "Content-Type": "application/json" }
+        );
+
+        // --- Check ONLY for PHP success ---
+        if (phpResponse && phpResponse.success) {
+          // --- Notify & Update Sockets ---
+
+          // 1. Notify removed ONLINE users and make them leave the room
+          userIdsToRemove.forEach((removedUserId) => {
+            const userSocketsSet = connectedUsers.get(removedUserId); // Get the Set of sockets for the user
+            if (userSocketsSet && userSocketsSet.size > 0) {
+              userSocketsSet.forEach((targetSocketId) => {
+                const targetSocket = io.sockets.sockets.get(targetSocketId);
+                if (targetSocket) {
+                  // Notify first
+                  targetSocket.emit("removedFromGroup", {
+                    channelId: channelId,
+                    // Cannot reliably get channel name here anymore
+                    message: `You were removed from a group.`,
+                  });
+                  // Make them leave the Socket.IO room
+                  targetSocket.leave(`channel_${channelId}`);
+                }
+              });
+            }
+          });
+
+          // 2. *** EMIT SPECIFIC EVENT TO REMAINING MEMBERS ***
+          // Send the IDs of users who were removed so clients can update locally
+          socket.to(`channel_${channelId}`).emit("membersRemovedFromGroup", {
+            channelId: channelId,
+            removedUserIds: userIdsToRemove, // Send the list of removed IDs
+            actorUserId: requesterUserId, // Optionally send who performed the action
+          });
+
+          // 3. Send success callback to the original requester (NO channel data)
+          callback({ success: true }); // <-- Indicate success only
+        } else {
+          // PHP call failed or returned success: false
+          const errorMsg =
+            phpResponse?.message || "PHP request indicated failure";
+          console.warn(`${logPrefix} PHP remove members failed: ${errorMsg}`);
+          callback({ success: false, error: errorMsg });
+        }
+      } catch (error) {
+        // Handle exceptions during the process (e.g., network error calling PHP)
+        console.error(`${logPrefix} !!! EXCEPTION: ${error.message}`);
+        if (error.response) {
+          console.error(
+            `${logPrefix} PHP Error Status:`,
+            error.response.status
+          );
+          console.error(
+            `${logPrefix} PHP Error Response:`,
+            error.response.data
+          );
+        } else {
+          console.error(error);
+        }
+        callback({
+          success: false,
+          error:
+            error.response?.data?.message ||
+            error.message ||
+            "Failed to remove members due to server error",
         });
       }
     }
@@ -1122,10 +1228,6 @@ const registerSocketHandlers = (io, socket) => {
   // --- Disconnect ---
   // --- Disconnect Handler (Revised for Online Status) ---
   socket.on("disconnect", (reason) => {
-    console.log(
-      `Socket ${socket.id} for user ${userId} disconnected. Reason: ${reason}`
-    );
-
     if (connectedUsers.has(userId)) {
       const userSockets = connectedUsers.get(userId);
       userSockets.delete(socket.id);
@@ -1133,18 +1235,13 @@ const registerSocketHandlers = (io, socket) => {
       // If this was the LAST socket, update PHP status to offline
       if (userSockets.size === 0) {
         connectedUsers.delete(userId); // Remove user entry
-        console.log(
-          `User ${userId} fully disconnected. Updating PHP status to offline.`
-        );
 
         updatePhpOnlineStatus(userToken, false) // Use the token from the disconnecting socket
           .then((phpResponse) => {
             // Extract lastSeen from PHP response if available, otherwise use Node time
             const lastSeen =
               phpResponse?.data?.last_seen_at || new Date().toISOString();
-            console.log(
-              `PHP status updated to offline for ${userId}. Broadcasting userOffline.`
-            );
+
             io.emit("userOffline", { userId, lastSeen }); // Broadcast with timestamp
           })
           .catch((error) => {

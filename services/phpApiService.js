@@ -41,9 +41,6 @@ const updatePhpOnlineStatus = async (token, isOnline) => {
     throw new Error("Authentication token missing for status update.");
   }
   try {
-    console.log(
-      `[Node Service] Calling PHP PUT /user/change-online-status with is_online: ${isOnline}`
-    );
     // Using makePhpRequest helper which includes auth header
     const responseData = await makePhpRequest(
       "put", // Use PUT method
@@ -52,8 +49,6 @@ const updatePhpOnlineStatus = async (token, isOnline) => {
       { is_online: isOnline } // Send JSON payload
     );
 
-    // Assuming PHP response structure: { success: true, message: "...", data: { last_seen_at: "..." } } (when going offline)
-    console.log(`[Node Service] PHP update status response:`, responseData);
     return responseData; // Return the full response
   } catch (error) {
     // Log the specific error from the PHP call

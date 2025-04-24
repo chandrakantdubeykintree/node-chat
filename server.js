@@ -39,8 +39,6 @@ const io = new Server(server, {
 });
 
 app.get("/", (req, res) => {
-  console.log("baru hit root");
-  console.log(io);
   res.send("Hello World");
 });
 
@@ -54,8 +52,6 @@ io.use(socketAuth);
 
 // Handle Socket.IO Connections
 io.on("connection", (socket) => {
-  console.log("connection established");
-
   // Authentication was successful in middleware
   // socket.userData and socket.token are available here
   // Register all event handlers for this connected socket
@@ -64,9 +60,7 @@ io.on("connection", (socket) => {
 
 // Start the server
 server.listen(config.port, () => {
-  console.log(`Node.js intermediate server listening on port ${config.port}`);
-  console.log(`Allowed Origin: ${config.allowedOrigin}`);
-  console.log(`PHP Backend URL: ${config.phpBackendUrl}`);
+  console.log(`Node.js intermediate server listening incoming requests.`);
 });
 
 // Graceful shutdown (optional but recommended)
