@@ -83,6 +83,30 @@ const registerSocketHandlers = (io, socket) => {
       });
   }
 
+  const safeCallback = (callback, ...args) => {
+    if (typeof callback === "function") {
+      try {
+        // Use JSON.stringify with the replacer for logging complex args if needed
+        // console.log(`${baseLogPrefix} Executing callback with args:`, JSON.stringify(args, safeStringify));
+        callback(...args);
+      } catch (e) {
+        console.error(
+          `${baseLogPrefix} !!! EXCEPTION during callback execution:`,
+          e
+        );
+        // Avoid crashing Node if the client-provided callback fails
+      }
+    } else {
+      // Log if a callback was expected but not provided or not a function
+      if (callback !== undefined) {
+        // Only log if something was passed but wasn't a function
+        console.warn(
+          `${baseLogPrefix} Received event but callback was not a function (type: ${typeof callback}).`
+        );
+      }
+    }
+  };
+
   // --- Channel Handling ---
 
   socket.on("getChannels", async (callback) => {
@@ -406,6 +430,8 @@ const registerSocketHandlers = (io, socket) => {
         `/user/channels/${channelId}`,
         userToken
       );
+
+      console.log(response, "response");
 
       if (response.success) {
         // Notify everyone who was part of that channel
@@ -997,81 +1023,71 @@ const registerSocketHandlers = (io, socket) => {
   socket.on(
     "addMembersToGroup",
     async ({ channelId, userIdsToAdd }, callback) => {
-      // Removed 'name' - channel name shouldn't be sent here unless PHP needs it
       const socketId = socket.id;
       const logPrefix = `[Socket ${socketId}][addMembers][Chan ${channelId}]`;
-      const requesterUserId = userId; // User performing the action
-      const requesterToken = userToken;
-
-      // --- Validation ---
-      if (typeof callback !== "function")
-        return console.error(`${logPrefix} Callback missing!`);
+      const cb = (...args) => safeCallback(callback, ...args); // Use safe callback wrapper
       if (!channelId)
-        return callback({ success: false, error: "Channel ID required" });
-      if (!requesterToken)
-        return callback({ success: false, error: "Auth token missing." });
-      if (!Array.isArray(userIdsToAdd) || userIdsToAdd.length === 0) {
-        return callback({ success: false, error: "User IDs array required." });
-      }
-      // --- End Validation ---
+        return cb({ success: false, error: "Channel ID required." });
+      if (!Array.isArray(userIdsToAdd) || userIdsToAdd.length === 0)
+        return cb({ success: false, error: "User IDs required." });
 
       try {
-        // --- Call PHP using makePhpRequest with JSON ---
         const phpPath = `/user/channels/${channelId}/add-users`;
-        const payload = { user_ids: userIdsToAdd }; // Send JSON payload
-
-        // Use 'put' or 'post' based on your PHP API design for adding users
-        // Let's assume PUT for consistency with how you structured the request before
-        const phpResponse = await makePhpRequest(
-          "post", // Or "post" if PHP expects that
+        const payload = { user_ids: userIdsToAdd };
+        const phpAddResponse = await makePhpRequest(
+          "post",
           phpPath,
-          requesterToken,
-          payload, // Send JSON data directly
-          { "Content-Type": "application/json" } // Explicitly set Content-Type for JSON
+          userToken,
+          payload,
+          { "Content-Type": "application/json" }
         );
-        // --- End Call PHP ---
 
-        if (phpResponse && phpResponse.success) {
-          const updatedChannelData = phpResponse.data; // <-- Expect full channel data
-
-          // --- Basic Check on Response Data ---
-          if (
-            !updatedChannelData ||
-            !updatedChannelData.id ||
-            !Array.isArray(updatedChannelData.users)
-          ) {
-            console.error(
-              `${logPrefix} PHP success but response data is incomplete/invalid.`
+        if (phpAddResponse?.success) {
+          // --- Fetch latest channel data AFTER adding ---
+          let updatedChannelData;
+          try {
+            const phpGetResponse = await makePhpRequest(
+              "get",
+              `/user/channels/${channelId}`,
+              userToken
             );
-            // Decide how to handle: maybe return success but warn, or treat as error
-            return callback({
+            if (phpGetResponse?.success && phpGetResponse?.data) {
+              updatedChannelData = phpGetResponse.data;
+            } else {
+              throw new Error(
+                "Failed to fetch updated channel data after adding members."
+              );
+            }
+          } catch (fetchError) {
+            console.error(
+              `${logPrefix} addMembers EXCEPTION fetching updated data (Chan ${channelId}):`,
+              fetchError.message
+            );
+            // Proceed without broadcasting updated data? Or return error? Let's return error for consistency.
+            return cb({
               success: false,
-              error:
-                "Server error: Incomplete update data received from backend.",
+              error: "Members added, but failed to refresh channel data.",
             });
           }
-          // --- End Basic Check ---
+          // --- End Fetch ---
 
-          // --- Notify & Update Sockets ---
-          const newMemberIds = new Set(userIdsToAdd); // For quick lookup
+          if (!updatedChannelData || !updatedChannelData.id)
+            throw new Error("Invalid updated channel data fetched.");
 
-          // 1. Make newly added ONLINE users join the Socket.IO room
-          // 2. Notify newly added ONLINE users they've been added (send full channel data)
-          updatedChannelData.users.forEach((user) => {
+          const newMemberIds = new Set(userIdsToAdd);
+
+          // Notify and join new ONLINE members
+          updatedChannelData.users?.forEach((user) => {
             if (newMemberIds.has(user.id)) {
-              const userSockets = connectedUsers.get(user.id); // Get Set of sockets for the user
-              if (userSockets && userSockets.size > 0) {
-                userSockets.forEach((targetSocketId) => {
+              const userSocketsSet = connectedUsers.get(user.id);
+              if (userSocketsSet?.size > 0) {
+                userSocketsSet.forEach((targetSocketId) => {
                   const targetSocket = io.sockets.sockets.get(targetSocketId);
                   if (targetSocket) {
                     targetSocket.join(`channel_${channelId}`);
-
-                    // Send the full channel data so their list/view updates correctly
                     targetSocket.emit("channelUpdated", {
-                      // Use the standard update event
-                      channelId: channelId,
+                      channelId,
                       channelData: updatedChannelData,
-                      message: `You were added to the group "${updatedChannelData.name}"`, // Optional notification message
                     });
                   }
                 });
@@ -1079,41 +1095,34 @@ const registerSocketHandlers = (io, socket) => {
             }
           });
 
-          // 3. Broadcast the full channel update to EVERYONE now in the room (including the new members and the person who added them)
+          // Broadcast the FULL update to ALL members in the room
           io.to(`channel_${channelId}`).emit("channelUpdated", {
-            channelId: channelId,
+            channelId,
             channelData: updatedChannelData,
           });
 
-          // 4. Send success callback to the original requester
-          callback({ success: true, channel: updatedChannelData });
+          // Send success callback to the requester (with updated data is fine here if needed by AddParticipantsView)
+          cb({ success: true, channel: updatedChannelData });
         } else {
-          const errorMsg =
-            phpResponse?.message || "PHP request indicated failure";
-          console.warn(`${logPrefix} PHP add members failed: ${errorMsg}`);
-          callback({ success: false, error: errorMsg });
+          console.warn(
+            `${logPrefix} addMembers PHP Error (Chan ${channelId}): ${phpAddResponse?.message}`
+          );
+          cb({
+            success: false,
+            error: phpAddResponse?.message || "Failed to add members.",
+          });
         }
       } catch (error) {
-        console.error(`${logPrefix} !!! EXCEPTION: ${error.message}`);
-        // Log detailed error if available (e.g., from axios)
-        if (error.response) {
-          console.error(
-            `${logPrefix} PHP Error Status:`,
-            error.response.status
-          );
-          console.error(
-            `${logPrefix} PHP Error Response:`,
-            error.response.data
-          );
-        } else {
-          console.error(error); // Log the whole error object for other cases
-        }
-        callback({
+        console.error(
+          `${logPrefix} addMembers EXCEPTION (Chan ${channelId}):`,
+          error.response?.data || error.message
+        );
+        cb({
           success: false,
           error:
             error.response?.data?.message ||
             error.message ||
-            "Failed to add members due to server error",
+            "Could not add members.",
         });
       }
     }
@@ -1124,102 +1133,111 @@ const registerSocketHandlers = (io, socket) => {
     async ({ channelId, userIdsToRemove }, callback) => {
       const socketId = socket.id;
       const logPrefix = `[Socket ${socketId}][removeMembers][Chan ${channelId}]`;
-      const requesterUserId = userId;
-      const requesterToken = userToken;
-
-      // --- Validation (Keep as is) ---
-      if (typeof callback !== "function")
-        return console.error(`${logPrefix} Callback missing!`);
+      const cb = (...args) => safeCallback(callback, ...args);
       if (!channelId)
-        return callback({ success: false, error: "Channel ID required" });
-      if (!requesterToken)
-        return callback({ success: false, error: "Auth token missing." });
-      if (!Array.isArray(userIdsToRemove) || userIdsToRemove.length === 0) {
-        return callback({ success: false, error: "User IDs array required." });
-      }
-      if (userIdsToRemove.includes(requesterUserId)) {
-        return callback({
-          success: false,
-          error:
-            "You cannot remove yourself using this action. Use 'Leave Group'.",
-        });
-      }
-      // --- End Validation ---
+        return cb({ success: false, error: "Channel ID required." });
+      if (!Array.isArray(userIdsToRemove) || userIdsToRemove.length === 0)
+        return cb({ success: false, error: "User IDs required." });
+      if (userIdsToRemove.includes(userId))
+        return cb({ success: false, error: "Cannot remove yourself." });
 
       try {
-        // --- Call PHP (Endpoint might be POST or DELETE, adjust method) ---
         const phpPath = `/user/channels/${channelId}/remove-users`;
         const payload = { user_ids: userIdsToRemove };
-        const phpResponse = await makePhpRequest(
-          "post", // <-- Ensure this method matches your PHP API (POST or PUT or DELETE)
+        const phpRemoveResponse = await makePhpRequest(
+          "post",
           phpPath,
-          requesterToken,
+          userToken,
           payload,
           { "Content-Type": "application/json" }
-        );
+        ); // Or appropriate method
 
-        // --- Check ONLY for PHP success ---
-        if (phpResponse && phpResponse.success) {
-          // --- Notify & Update Sockets ---
-
-          // 1. Notify removed ONLINE users and make them leave the room
+        if (phpRemoveResponse?.success) {
+          // --- Notify removed ONLINE users and make them leave ---
           userIdsToRemove.forEach((removedUserId) => {
-            const userSocketsSet = connectedUsers.get(removedUserId); // Get the Set of sockets for the user
-            if (userSocketsSet && userSocketsSet.size > 0) {
+            const userSocketsSet = connectedUsers.get(removedUserId);
+            if (userSocketsSet?.size > 0) {
               userSocketsSet.forEach((targetSocketId) => {
                 const targetSocket = io.sockets.sockets.get(targetSocketId);
                 if (targetSocket) {
-                  // Notify first
                   targetSocket.emit("removedFromGroup", {
-                    channelId: channelId,
-                    // Cannot reliably get channel name here anymore
-                    message: `You were removed from a group.`,
+                    channelId,
+                    message: `You were removed from the group.`,
                   });
-                  // Make them leave the Socket.IO room
                   targetSocket.leave(`channel_${channelId}`);
                 }
               });
             }
           });
+          // --- End Notify Removed ---
 
-          // 2. *** EMIT SPECIFIC EVENT TO REMAINING MEMBERS ***
-          // Send the IDs of users who were removed so clients can update locally
-          socket.to(`channel_${channelId}`).emit("membersRemovedFromGroup", {
-            channelId: channelId,
-            removedUserIds: userIdsToRemove, // Send the list of removed IDs
-            actorUserId: requesterUserId, // Optionally send who performed the action
-          });
+          // --- Fetch latest channel data AFTER removing ---
+          let updatedChannelData;
+          try {
+            const phpGetResponse = await makePhpRequest(
+              "get",
+              `/user/channels/${channelId}`,
+              userToken
+            );
+            if (phpGetResponse?.success && phpGetResponse?.data) {
+              updatedChannelData = phpGetResponse.data;
+            } else {
+              // If fetching updated data fails, maybe the group is now empty or deleted?
+              // Or maybe just an API error. We should still inform the requester of success,
+              // but might not be able to broadcast the update reliably.
+              console.warn(
+                `${logPrefix} removeMembers: Failed to fetch updated channel data after removal (Chan ${channelId}). Group might be empty or API error.`
+              );
+              // Let's still send success back, but can't broadcast update. Client state might become slightly stale.
+              return cb({ success: true }); // Indicate removal success even if fetch failed
+            }
+          } catch (fetchError) {
+            console.error(
+              `${logPrefix} removeMembers EXCEPTION fetching updated data (Chan ${channelId}):`,
+              fetchError.message
+            );
+            // As above, return success but log the fetch error.
+            return cb({ success: true });
+          }
+          // --- End Fetch ---
 
-          // 3. Send success callback to the original requester (NO channel data)
-          callback({ success: true }); // <-- Indicate success only
+          // --- Broadcast 'channelUpdated' to REMAINING members ---
+          // Ensure updatedChannelData exists before broadcasting
+          if (updatedChannelData && updatedChannelData.id) {
+            // Emit to the room (only remaining members are in it now)
+            io.to(`channel_${channelId}`).emit("channelUpdated", {
+              channelId,
+              channelData: updatedChannelData,
+            });
+          } else {
+            console.warn(
+              `${logPrefix} removeMembers: Skipping broadcast as updatedChannelData is missing/invalid.`
+            );
+          }
+
+          // Send success callback to the original requester
+          // No channel data needed here, update comes via broadcast.
+          cb({ success: true });
         } else {
-          // PHP call failed or returned success: false
-          const errorMsg =
-            phpResponse?.message || "PHP request indicated failure";
-          console.warn(`${logPrefix} PHP remove members failed: ${errorMsg}`);
-          callback({ success: false, error: errorMsg });
+          console.warn(
+            `${logPrefix} removeMembers PHP Error (Chan ${channelId}): ${phpRemoveResponse?.message}`
+          );
+          cb({
+            success: false,
+            error: phpRemoveResponse?.message || "Failed to remove members.",
+          });
         }
       } catch (error) {
-        // Handle exceptions during the process (e.g., network error calling PHP)
-        console.error(`${logPrefix} !!! EXCEPTION: ${error.message}`);
-        if (error.response) {
-          console.error(
-            `${logPrefix} PHP Error Status:`,
-            error.response.status
-          );
-          console.error(
-            `${logPrefix} PHP Error Response:`,
-            error.response.data
-          );
-        } else {
-          console.error(error);
-        }
-        callback({
+        console.error(
+          `${logPrefix} removeMembers EXCEPTION (Chan ${channelId}):`,
+          error.response?.data || error.message
+        );
+        cb({
           success: false,
           error:
             error.response?.data?.message ||
             error.message ||
-            "Failed to remove members due to server error",
+            "Could not remove members.",
         });
       }
     }
