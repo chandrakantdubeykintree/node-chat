@@ -197,9 +197,28 @@ const registerSocketHandlers = (io, socket) => {
     "sendMessage",
     async ({ channelId, message, attachment_id }, callback) => {
       try {
+        // Validate input
+        if (!channelId) {
+          return callback({ success: false, error: "Channel ID is required" });
+        }
+
+        // Check if at least one of message or attachment_id is provided
+        if (!message && !attachment_id) {
+          return callback({
+            success: false,
+            error: "Either message text or attachment is required",
+          });
+        }
+
         // Use FormData because PHP expects it
         const formData = new FormData();
-        formData.append("message", message);
+
+        // Only append message if it exists and is not empty
+        if (message && message.trim()) {
+          formData.append("message", message.trim());
+        }
+
+        // Only append attachment_id if it exists
         if (attachment_id) {
           formData.append("attachment_id", attachment_id);
         }
