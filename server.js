@@ -14,12 +14,17 @@ const server = http.createServer(app);
 app.use(
   cors({
     // origin: config.frontendUrl,
-    origin: ["*", "http://localhost:3000/", "https://kintree.info/"],
+    origin: [
+      "*",
+      "http://localhost:3000/",
+      "https://kintree.info/",
+      "https://app.kintree.com/",
+    ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
     exposedHeaders: ["Access-Control-Allow-Origin"],
-  })
+  }),
 ); // CORS for potential future HTTP routes on Node
 app.use(express.json()); // If you add any standard Express routes
 
@@ -27,7 +32,12 @@ app.use(express.json()); // If you add any standard Express routes
 const io = new Server(server, {
   cors: {
     // origin: config.allowedOrigin, // Allow React frontend
-    origin: ["*", "http://localhost:3000/", "https://kintree.info/"],
+    origin: [
+      "*",
+      "http://localhost:3000/",
+      "https://kintree.info/",
+      "https://app.kintree.com/",
+    ],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
     exposedHeaders: ["Access-Control-Allow-Origin"],
